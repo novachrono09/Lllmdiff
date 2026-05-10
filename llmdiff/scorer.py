@@ -8,7 +8,7 @@ from groq import AsyncGroq
 from tqdm.asyncio import tqdm
 
 # --- Configuration ---
-GROQ_MODEL = "qwen-3-32b"  # Latest Qwen model on Groq
+GROQ_MODEL = "qwen/qwen3-32b"  # Exact model ID for Groq
 CONCURRENCY_LIMIT = 5
 
 # Map of dimension IDs (as they appear in battery.json) to prompt filenames
