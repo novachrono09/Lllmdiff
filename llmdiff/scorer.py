@@ -1,14 +1,16 @@
 import json
 import os
 import asyncio
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
 # --- Configuration ---
-GROQ_MODEL = "qwen/qwen3-32b"  # Exact model ID for Groq
+POLLINATIONS_MODEL = "openai"
+BASE_URL = "https://gen.pollinations.ai"
 CONCURRENCY_LIMIT = 5
 
 # Map of dimension IDs (as they appear in battery.json) to prompt filenames
@@ -23,7 +25,7 @@ DIMENSION_MAP = {
 
 class BehavioralScorer:
     def __init__(self, api_key: str, root_path: Path):
-        self.client = AsyncGroq(api_key=api_key)
+        self.client = AsyncOpenAI(api_key=api_key, base_url=BASE_URL)
         self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
         self.root_path = root_path
         self.prompts_path = root_path / "scorer_prompts"
@@ -39,37 +41,60 @@ class BehavioralScorer:
             else:
                 print(f"Warning: Template for {dim} not found at {file_path}")
 
+    def clean_json_response(self, text: str) -> Dict[str, Any]:
+        """Robustly parses JSON from LLM output, handling markdown blocks and filler."""
+        try:
+            # 1. Try direct parsing
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # 2. Try extracting JSON from markdown code blocks
+            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            
+            # 3. Try finding the first '{' and last '}'
+            match = re.search(r'(\{.*\})', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    pass
+            
+            raise ValueError("Could not extract valid JSON")
+
     async def get_score(self, dimension: str, user_prompt: str, model_response: str, baseline_truth: str = "N/A") -> Dict[str, Any]:
-        """Evaluates a single response using the Groq API."""
+        """Evaluates a single response using the Pollinations API."""
         template = self.prompt_cache.get(dimension)
         if not template:
             return {"reasoning": f"Missing template for {dimension}", "score": 0}
 
-        # Safe formatting of the template
         try:
             formatted_prompt = template.format(
                 user_prompt=user_prompt,
                 model_response=model_response,
                 baseline_truth=baseline_truth
             )
-        except Exception as e:
-            # Fallback if template uses different keys or formatting fails
+        except Exception:
             formatted_prompt = f"{template}\n\nUSER PROMPT: {user_prompt}\nMODEL RESPONSE: {model_response}"
 
         async with self.semaphore:
             try:
+                # Note: Pollinations might ignore response_format, so we rely on strict system instructions
                 completion = await self.client.chat.completions.create(
                     messages=[
-                        {"role": "system", "content": formatted_prompt},
-                        {"role": "user", "content": "Return the JSON evaluation now."}
+                        {"role": "system", "content": formatted_prompt + "\nIMPORTANT: Return ONLY valid JSON in format: {\"reasoning\": \"string\", \"score\": int 0-10}"},
+                        {"role": "user", "content": "Begin evaluation."}
                     ],
-                    model=GROQ_MODEL,
-                    response_format={"type": "json_object"},
+                    model=POLLINATIONS_MODEL,
                     temperature=0.0,
                 )
                 
-                result = json.loads(completion.choices[0].message.content)
-                # Ensure keys exist and are of correct type
+                content = completion.choices[0].message.content
+                result = self.clean_json_response(content)
+                
                 return {
                     "reasoning": str(result.get("reasoning", "No reasoning provided")),
                     "score": int(result.get("score", 0))
@@ -103,12 +128,8 @@ class BehavioralScorer:
         return item
 
 async def main():
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("CRITICAL: GROQ_API_KEY not found in environment.")
-        return
-
-    # Resolve paths relative to this script's location (llmdiff/scorer.py -> root/)
+    api_key = os.environ.get("POLLINATIONS_API_KEY", "no_key_needed_for_free_tier")
+    
     root_dir = Path(__file__).parent.parent.absolute()
     input_path = root_dir / "raw_responses.json"
     output_path = root_dir / "scored_responses.json"
@@ -123,7 +144,7 @@ async def main():
     scorer = BehavioralScorer(api_key, root_dir)
     await scorer.load_templates()
 
-    print(f"Starting behavioral evaluation of {len(data)} items...")
+    print(f"Starting behavioral evaluation of {len(data)} items using Pollinations ({POLLINATIONS_MODEL})...")
     
     tasks = [scorer.process_item(item) for item in data]
     scored_results = await tqdm.gather(*tasks, desc="Judging Divergence")
