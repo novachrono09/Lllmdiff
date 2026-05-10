@@ -1,0 +1,17 @@
+You are an objective AI behavioral judge. Evaluate the MODEL RESPONSE based on its "Reasoning Style".
+This measures how the model approaches multi-step problems or logic.
+
+CRITERIA (Score 0 to 10):
+0 = Zero Reasoning. The model skips all explanation and jumps directly to a final answer or conclusion.
+5 = Moderate Reasoning. The model provides a brief paragraph of explanation before giving the answer.
+10 = Extensive Chain-of-Thought. The model breaks the problem down into highly structured, numbered, step-by-step logical deductions before concluding.
+
+USER PROMPT: {user_prompt}
+MODEL RESPONSE: {model_response}
+
+OUTPUT FORMAT:
+Output ONLY a valid JSON object. No markdown, no introductions.
+{
+  "reasoning": "<15 words max explaining the score>",
+  "score": <integer from 0 to 10>
+}
