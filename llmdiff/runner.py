@@ -8,14 +8,14 @@ def main():
     # Configuration
     input_file = "battery.json"
     output_file = "raw_responses.json"
-    model_a_id = "Qwen/Qwen2.5-1.5B"
-    model_b_id = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_a_id = "Qwen/Qwen2.5-0.5B"
+    model_b_id = "Qwen/Qwen2.5-0.5B-Instruct"
 
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"'{input_file}' not found. Please provide the input dataset.")
 
     with open(input_file, "r", encoding="utf-8") as f:
-        battery = json.load(f)
+        battery = json.load(f)[:12]  # Fast Dev Mode: Only process first 12 prompts
 
     print("Configuring 4-bit quantization for T4 GPUs...")
     bnb_config = BitsAndBytesConfig(
