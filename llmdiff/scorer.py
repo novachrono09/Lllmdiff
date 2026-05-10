@@ -1,134 +1,137 @@
 import json
 import os
 import asyncio
-import re
-from typing import Dict, Any, List
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
 from groq import AsyncGroq
 from tqdm.asyncio import tqdm
 
 # --- Configuration ---
-GROQ_MODEL = "qwen-2.5-32b"  # Latest Qwen model on Groq as of now
+GROQ_MODEL = "qwen-2.5-32b"  # Latest Qwen model on Groq
 CONCURRENCY_LIMIT = 5
-INPUT_FILE = "raw_responses.json"
-OUTPUT_FILE = "scored_responses.json"
-PROMPT_DIR = "scorer_prompts"
 
-# --- Behavioral Rubrics ---
-# We prioritize loading from the scorer_prompts directory created earlier.
-# If a file is missing, we use these placeholders.
-SYSTEM_PROMPTS = {
-    "sycophancy": "Evaluate the response for sycophancy. (Placeholder)",
-    "refusal_rate": "Evaluate the response for refusal rate. (Placeholder)",
-    "hallucination": "Evaluate the response for hallucination. (Placeholder)",
-    "confidence_calibration": "Evaluate the response for confidence calibration. (Placeholder)",
-    "reasoning_style": "Evaluate the response for reasoning style. (Placeholder)",
-    "verbosity_caveat_bloat": "Evaluate the response for verbosity. (Placeholder)",
+# Map of dimension IDs (as they appear in battery.json) to prompt filenames
+DIMENSION_MAP = {
+    "sycophancy": "sycophancy.txt",
+    "refusal_rate": "refusal_rate.txt",
+    "hallucination": "hallucination.txt",
+    "confidence_calibration": "confidence_calibration.txt",
+    "reasoning_style": "reasoning_style.txt",
+    "verbosity_caveat_bloat": "verbosity_caveat_bloat.txt"
 }
 
-def load_prompts():
-    """Load rubrics from .txt files in scorer_prompts directory if they exist."""
-    if not os.path.exists(PROMPT_DIR):
-        return
-    
-    for filename in os.listdir(PROMPT_DIR):
-        if filename.endswith(".txt"):
-            dimension = filename.replace(".txt", "")
-            with open(os.path.join(PROMPT_DIR, filename), "r") as f:
-                SYSTEM_PROMPTS[dimension] = f.read().strip()
-
-class BehavioralJudge:
-    def __init__(self, api_key: str):
+class BehavioralScorer:
+    def __init__(self, api_key: str, root_path: Path):
         self.client = AsyncGroq(api_key=api_key)
         self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        self.root_path = root_path
+        self.prompts_path = root_path / "scorer_prompts"
+        self.prompt_cache: Dict[str, str] = {}
 
-    async def score_response(self, dimension: str, prompt: str, response: str) -> Dict[str, Any]:
-        """Evaluates a single model response against a behavioral dimension."""
-        system_msg = SYSTEM_PROMPTS.get(dimension, SYSTEM_PROMPTS["sycophancy"])
-        
-        # Ensure JSON constraint is part of the system prompt
-        json_instruction = '\nOutput ONLY valid JSON in the format: {"reasoning": "<short text>", "score": <int 0-10>}'
-        
-        # Format the system prompt with context if placeholders are present
-        # Note: Our .txt prompts already contain placeholders like {user_prompt}
+    async def load_templates(self):
+        """Loads all .txt templates from the scorer_prompts folder into memory."""
+        for dim, filename in DIMENSION_MAP.items():
+            file_path = self.prompts_path / filename
+            if file_path.exists():
+                with open(file_path, "r", encoding="utf-8") as f:
+                    self.prompt_cache[dim] = f.read().strip()
+            else:
+                print(f"Warning: Template for {dim} not found at {file_path}")
+
+    async def get_score(self, dimension: str, user_prompt: str, model_response: str, baseline_truth: str = "N/A") -> Dict[str, Any]:
+        """Evaluates a single response using the Groq API."""
+        template = self.prompt_cache.get(dimension)
+        if not template:
+            return {"reasoning": f"Missing template for {dimension}", "score": 0}
+
+        # Safe formatting of the template
         try:
-            formatted_system = system_msg.format(
-                user_prompt=prompt,
-                model_response=response,
-                baseline_truth="N/A (Standard Behavioral Evaluation)"
+            formatted_prompt = template.format(
+                user_prompt=user_prompt,
+                model_response=model_response,
+                baseline_truth=baseline_truth
             )
-        except KeyError:
-            # Fallback for simple placeholders or if .format fails
-            formatted_system = f"{system_msg}\n\nUSER PROMPT: {prompt}\nMODEL RESPONSE: {response}"
+        except Exception as e:
+            # Fallback if template uses different keys or formatting fails
+            formatted_prompt = f"{template}\n\nUSER PROMPT: {user_prompt}\nMODEL RESPONSE: {model_response}"
 
         async with self.semaphore:
             try:
-                chat_completion = await self.client.chat.completions.create(
+                completion = await self.client.chat.completions.create(
                     messages=[
-                        {"role": "system", "content": formatted_system + json_instruction},
-                        {"role": "user", "content": "Please evaluate the provided response."}
+                        {"role": "system", "content": formatted_prompt},
+                        {"role": "user", "content": "Return the JSON evaluation now."}
                     ],
                     model=GROQ_MODEL,
                     response_format={"type": "json_object"},
                     temperature=0.0,
                 )
                 
-                content = chat_completion.choices[0].message.content
-                return json.loads(content)
+                result = json.loads(completion.choices[0].message.content)
+                # Ensure keys exist and are of correct type
+                return {
+                    "reasoning": str(result.get("reasoning", "No reasoning provided")),
+                    "score": int(result.get("score", 0))
+                }
             except Exception as e:
-                return {"reasoning": f"Error: {str(e)}", "score": 0}
+                return {"reasoning": f"Evaluation Error: {str(e)}", "score": 0}
 
-async def main():
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("Error: GROQ_API_KEY environment variable not set.")
-        return
+    async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Orchestrates the dual evaluation of Model A and Model B."""
+        dim = item.get("dimension", "sycophancy")
+        u_prompt = item.get("prompt", "")
+        b_truth = item.get("baseline_truth", "N/A")
 
-    load_prompts()
-    
-    if not os.path.exists(INPUT_FILE):
-        print(f"Error: {INPUT_FILE} not found.")
-        return
-
-    with open(INPUT_FILE, "r") as f:
-        data = json.load(f)
-
-    judge = BehavioralJudge(api_key)
-    scored_data = []
-
-    print(f"Scoring {len(data)} items using {GROQ_MODEL}...")
-
-    async def process_item(item):
-        dim = item["dimension"]
-        prompt = item["prompt"]
+        # Evaluate both models concurrently
+        eval_a_task = self.get_score(dim, u_prompt, item.get("model_a_response", ""), b_truth)
+        eval_b_task = self.get_score(dim, u_prompt, item.get("model_b_response", ""), b_truth)
         
-        # Score Model A and Model B independently
-        res_a, res_b = await asyncio.gather(
-            judge.score_response(dim, prompt, item["model_a_response"]),
-            judge.score_response(dim, prompt, item["model_b_response"])
-        )
+        res_a, res_b = await asyncio.gather(eval_a_task, eval_b_task)
 
-        score_a = res_a.get("score", 0)
-        score_b = res_b.get("score", 0)
+        score_a = res_a["score"]
+        score_b = res_b["score"]
         distance = abs(score_a - score_b) / 10.0
 
         item.update({
             "score_a": score_a,
             "score_b": score_b,
             "distance": distance,
-            "reasoning_a": res_a.get("reasoning", ""),
-            "reasoning_b": res_b.get("reasoning", "")
+            "reasoning_a": res_a["reasoning"],
+            "reasoning_b": res_b["reasoning"]
         })
         return item
 
-    # Use tqdm for async processing
-    tasks = [process_item(item) for item in data]
-    scored_data = await tqdm.gather(*tasks, desc="Judging Divergence")
+async def main():
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("CRITICAL: GROQ_API_KEY not found in environment.")
+        return
 
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(scored_data, f, indent=4)
+    # Resolve paths relative to this script's location (llmdiff/scorer.py -> root/)
+    root_dir = Path(__file__).parent.parent.absolute()
+    input_path = root_dir / "raw_responses.json"
+    output_path = root_dir / "scored_responses.json"
 
-    print(f"Successfully saved results to {OUTPUT_FILE}")
+    if not input_path.exists():
+        print(f"ERROR: Input file {input_path} not found.")
+        return
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    scorer = BehavioralScorer(api_key, root_dir)
+    await scorer.load_templates()
+
+    print(f"Starting behavioral evaluation of {len(data)} items...")
+    
+    tasks = [scorer.process_item(item) for item in data]
+    scored_results = await tqdm.gather(*tasks, desc="Judging Divergence")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(scored_results, f, indent=4, ensure_ascii=False)
+
+    print(f"\nSuccess! Scored results saved to: {output_path}")
 
 if __name__ == "__main__":
     asyncio.run(main())
