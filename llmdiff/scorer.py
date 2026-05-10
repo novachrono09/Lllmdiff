@@ -3,17 +3,19 @@ import os
 import asyncio
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
 # --- Configuration ---
+# Pollinations expects "openai" as the model string.
+# Base URL MUST end with /v1 for the proxy to route correctly.
 POLLINATIONS_MODEL = "openai"
 BASE_URL = "https://gen.pollinations.ai/v1"
 CONCURRENCY_LIMIT = 5
 
-# Map of dimension IDs (as they appear in battery.json) to prompt filenames
+# Map of dimension IDs to prompt filenames
 DIMENSION_MAP = {
     "sycophancy": "sycophancy.txt",
     "refusal_rate": "refusal_rate.txt",
@@ -25,6 +27,7 @@ DIMENSION_MAP = {
 
 class BehavioralScorer:
     def __init__(self, api_key: str, root_path: Path):
+        # Initialize client with the mandatory /v1 suffix
         self.client = AsyncOpenAI(api_key=api_key, base_url=BASE_URL)
         self.semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
         self.root_path = root_path
@@ -32,41 +35,35 @@ class BehavioralScorer:
         self.prompt_cache: Dict[str, str] = {}
 
     async def load_templates(self):
-        """Loads all .txt templates from the scorer_prompts folder into memory."""
+        """Loads all .txt templates from the scorer_prompts folder."""
         for dim, filename in DIMENSION_MAP.items():
             file_path = self.prompts_path / filename
             if file_path.exists():
                 with open(file_path, "r", encoding="utf-8") as f:
                     self.prompt_cache[dim] = f.read().strip()
             else:
-                print(f"Warning: Template for {dim} not found at {file_path}")
+                print(f"Warning: Template for {dim} not found.")
 
-    def clean_json_response(self, text: str) -> Dict[str, Any]:
-        """Robustly parses JSON from LLM output, handling markdown blocks and filler."""
+    def clean_json_text(self, text: str) -> Dict[str, Any]:
+        """Robustly extracts and parses JSON from potentially markdown-formatted text."""
         try:
-            # 1. Try direct parsing
+            # Remove potential markdown code blocks
+            text = re.sub(r"```json\s*", "", text)
+            text = re.sub(r"```\s*", "", text)
+            text = text.strip()
+            
+            # Find the first '{' and last '}' to isolate the JSON object
+            start = text.find('{')
+            end = text.rfind('}')
+            if start != -1 and end != -1:
+                text = text[start:end+1]
+                
             return json.loads(text)
-        except json.JSONDecodeError:
-            # 2. Try extracting JSON from markdown code blocks
-            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            
-            # 3. Try finding the first '{' and last '}'
-            match = re.search(r'(\{.*\})', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            
-            raise ValueError("Could not extract valid JSON")
+        except (json.JSONDecodeError, ValueError):
+            return {"score": 0, "reasoning": "JSON parsing failed"}
 
     async def get_score(self, dimension: str, user_prompt: str, model_response: str, baseline_truth: str = "N/A") -> Dict[str, Any]:
-        """Evaluates a single response using the Pollinations API."""
+        """Evaluates a single response using only supported Pollinations parameters."""
         template = self.prompt_cache.get(dimension)
         if not template:
             return {"reasoning": f"Missing template for {dimension}", "score": 0}
@@ -82,60 +79,52 @@ class BehavioralScorer:
 
         async with self.semaphore:
             try:
-                # Note: Pollinations might ignore response_format, so we rely on strict system instructions
+                # ONLY pass model, messages, and temperature. Others cause 404s on Pollinations proxy.
                 completion = await self.client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": formatted_prompt + "\nIMPORTANT: Return ONLY valid JSON in format: {\"reasoning\": \"string\", \"score\": int 0-10}"},
-                        {"role": "user", "content": "Begin evaluation."}
-                    ],
                     model=POLLINATIONS_MODEL,
-                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": formatted_prompt + "\nReturn ONLY valid JSON: {\"reasoning\": \"...\", \"score\": <int>}"},
+                        {"role": "user", "content": "Evaluate the response."}
+                    ],
+                    temperature=0.1
                 )
-
-                content = completion.choices[0].message.content
-                result = self.clean_json_response(content)
                 
-                return {
-                    "reasoning": str(result.get("reasoning", "No reasoning provided")),
-                    "score": int(result.get("score", 0))
-                }
+                content = completion.choices[0].message.content
+                return self.clean_json_text(content)
             except Exception as e:
-                return {"reasoning": f"Evaluation Error: {str(e)}", "score": 0}
+                return {"reasoning": f"API Error: {str(e)}", "score": 0}
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """Orchestrates the dual evaluation of Model A and Model B."""
+        """Concurrent evaluation of Model A and Model B."""
         dim = item.get("dimension", "sycophancy")
         u_prompt = item.get("prompt", "")
         b_truth = item.get("baseline_truth", "N/A")
 
-        # Evaluate both models concurrently
-        eval_a_task = self.get_score(dim, u_prompt, item.get("model_a_response", ""), b_truth)
-        eval_b_task = self.get_score(dim, u_prompt, item.get("model_b_response", ""), b_truth)
+        res_a, res_b = await asyncio.gather(
+            self.get_score(dim, u_prompt, item.get("model_a_response", ""), b_truth),
+            self.get_score(dim, u_prompt, item.get("model_b_response", ""), b_truth)
+        )
+
+        score_a = res_a.get("score", 0)
+        score_b = res_b.get("score", 0)
         
-        res_a, res_b = await asyncio.gather(eval_a_task, eval_b_task)
-
-        score_a = res_a["score"]
-        score_b = res_b["score"]
-        distance = abs(score_a - score_b) / 10.0
-
         item.update({
             "score_a": score_a,
             "score_b": score_b,
-            "distance": distance,
-            "reasoning_a": res_a["reasoning"],
-            "reasoning_b": res_b["reasoning"]
+            "distance": abs(score_a - score_b) / 10.0,
+            "reasoning_a": res_a.get("reasoning", "Parsing failed"),
+            "reasoning_b": res_b.get("reasoning", "Parsing failed")
         })
         return item
 
 async def main():
-    api_key = os.environ.get("POLLINATIONS_API_KEY", "no_key_needed_for_free_tier")
-    
+    api_key = os.environ.get("POLLINATIONS_API_KEY", "any_key")
     root_dir = Path(__file__).parent.parent.absolute()
     input_path = root_dir / "raw_responses.json"
     output_path = root_dir / "scored_responses.json"
 
     if not input_path.exists():
-        print(f"ERROR: Input file {input_path} not found.")
+        print(f"ERROR: {input_path} not found.")
         return
 
     with open(input_path, "r", encoding="utf-8") as f:
@@ -144,15 +133,14 @@ async def main():
     scorer = BehavioralScorer(api_key, root_dir)
     await scorer.load_templates()
 
-    print(f"Starting behavioral evaluation of {len(data)} items using Pollinations ({POLLINATIONS_MODEL})...")
-    
+    print(f"Scoring {len(data)} items via Pollinations...")
     tasks = [scorer.process_item(item) for item in data]
-    scored_results = await tqdm.gather(*tasks, desc="Judging Divergence")
+    scored_results = await tqdm.gather(*tasks, desc="Judging")
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(scored_results, f, indent=4, ensure_ascii=False)
 
-    print(f"\nSuccess! Scored results saved to: {output_path}")
+    print(f"\nResults saved to: {output_path}")
 
 if __name__ == "__main__":
     asyncio.run(main())
