@@ -10,7 +10,7 @@ from tqdm.asyncio import tqdm
 
 # --- Configuration ---
 POLLINATIONS_MODEL = "openai"
-BASE_URL = "https://gen.pollinations.ai"
+BASE_URL = "https://gen.pollinations.ai/v1"
 CONCURRENCY_LIMIT = 5
 
 # Map of dimension IDs (as they appear in battery.json) to prompt filenames
@@ -91,7 +91,7 @@ class BehavioralScorer:
                     model=POLLINATIONS_MODEL,
                     temperature=0.0,
                 )
-                
+
                 content = completion.choices[0].message.content
                 result = self.clean_json_response(content)
                 
